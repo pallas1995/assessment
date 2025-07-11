@@ -1,0 +1,122 @@
+Azure Cosmos DB cost optimization
+✅ No downtime
+✅ No changes to APIs
+✅ Archival of cold data
+✅ Seamless reads from archive
+✅ Easy-to-maintain, serverless Azure architecture
+✅ Scripts/pseudocode
+✅ Architecture diagram (textual)
+--------------------------------------
+High-Level Strategy
+
+We'll implement a Hot-Cold Tiered Storage architecture:
+Hot Data (≤ 3 months) stays in Cosmos DB (fast but expensive).
+Cold Data (> 3 months) is moved to Azure Blob Storage (cheap but slower).
+Read API first checks Cosmos DB, then falls back to Blob Storage transparently.
+A background job moves old records daily from Cosmos DB to Blob Storage.
+--------------------------------------
+Architecture Overview
+                      ┌──────────────────────────┐
+                      │       Client/API         │
+                      └────────────┬─────────────┘
+                                   │
+                ┌──────────────────▼──────────────────┐
+                │       Azure Function App (API)      │
+                │      (No change to API contract)    │
+                └───────┬────────────┬───────────────┘
+                        │            │
+              ┌─────────▼──┐   ┌─────▼──────────┐
+              │ Cosmos DB │   │ Azure Blob      │
+              │ (Hot Data)│   │ Storage (Cold)  │
+              └───────────┘   └─────────────────┘
+                        ▲
+                        │
+         ┌──────────────┴───────────────┐
+         │ Azure Function Timer Trigger│
+         │ (daily archive job)         │
+         └─────────────────────────────┘
+----------------------------------------------------
+Technologies Used
+
+| Component                | Azure Service          |
+| ------------------------ | ---------------------- |
+| Hot Storage              | Cosmos DB              |
+| Cold Storage             | Azure Blob Storage     |
+| Compute (API + archiver) | Azure Functions        |
+| Scheduler                | Azure Timer Trigger    |
+| Secure Access            | Managed Identity / SAS |
+-----------------------------------------------------------
+Implementation Details
+
+1. Daily Archival Job – Azure Function Timer Trigger
+Runs daily to archive data older than 3 months.
+
+Pseudocode: python
+from datetime import datetime, timedelta
+from azure.cosmos import CosmosClient
+from azure.storage.blob import BlobServiceClient
+import json
+
+# Init clients
+cosmos = CosmosClient(COSMOS_URL, credential=COSMOS_KEY)
+container = cosmos.get_database_client("billing").get_container_client("records")
+
+blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+blob_container = blob_service.get_container_client("billing-archive")
+
+cutoff_date = datetime.utcnow() - timedelta(days=90)
+
+# Archive old records
+for item in container.query_items(
+    query="SELECT * FROM c WHERE c.timestamp < @cutoff",
+    parameters=[{"name": "@cutoff", "value": cutoff_date.isoformat()}],
+    enable_cross_partition_query=True
+):
+    record_id = item["id"]
+    partition_key = item["partitionKey"]
+
+    # Save to Blob
+    blob_name = f"{partition_key}/{record_id}.json"
+    blob_container.upload_blob(blob_name, json.dumps(item), overwrite=True)
+
+    # Delete from Cosmos
+    container.delete_item(record_id, partition_key=partition_key)
+
+------------------------------------------------------------------
+2. Modified Read Logic (Still behind the same API)
+Update your Function that handles GET requests to billing records.
+
+Pseudocode:
+def get_billing_record(record_id, partition_key):
+    try:
+        # Try Cosmos DB first
+        return container.read_item(record_id, partition_key=partition_key)
+    except Exception:
+        # Fallback to Blob Storage
+        blob_name = f"{partition_key}/{record_id}.json"
+        blob_data = blob_container.download_blob(blob_name)
+        return json.loads(blob_data.readall())
+----------------------------------------------------------------------
+3. No Change to API Contracts
+The client-facing API stays the same. The logic behind the scenes handles dual-storage lookup.
+-----------------------------------------------------------------------------------------------
+4. Migration Plan for Existing Data
+Run a one-time batch job (similar to the daily job above) to archive records older than 90 days.
+
+This can be deployed as a temporary Azure Function or run locally with appropriate permissions.
+
+Throttle batch reads/writes to avoid RU spikes in Cosmos DB.
+
+------------------------------------------------------------------------------------------------
+Cost Optimization Impact
+| Layer        | Before             | After                        |
+| ------------ | ------------------ | ---------------------------- |
+| Cosmos DB    | Stores all records | Stores only recent 3 months  |
+| Blob Storage | Not used           | Stores older records cheaply |
+| Read Cost    | All reads = RU     | Archive reads = near free    |
+-------------------------------------------------------------------------------------------------
+Monitoring & Cost Tips:
+Use Cosmos DB autoscale with max RU capped.
+Monitor access patterns: If archived records are rarely read, consider Cool or Archive tier in Blob Storage.
+Set lifecycle rules on Blob Storage to move to colder tiers over time.
+
